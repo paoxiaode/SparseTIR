@@ -57,7 +57,7 @@ def sddmm(m: int, n: int, feat_size: int, nnz: int):
 
 def bench_sddmm(g: dgl.DGLGraph, feat_size: int):
     global sddmm
-    indptr, indices, _ = g.adj_sparse("csr")
+    indptr, indices, _ = g.adj_tensors("csr")
     m = g.num_src_nodes()
     n = g.num_dst_nodes()
     nnz = g.number_of_edges()
