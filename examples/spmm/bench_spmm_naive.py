@@ -15,19 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import argparse
+
 import dgl
+import numpy as np
+import scipy.sparse as sp
+import torch as th
 import tvm
+import tvm.sparse
 import tvm.testing
 import tvm.tir as tir
-import scipy.sparse as sp
-import argparse
-import numpy as np
-import torch as th
+from ogb.nodeproppred import DglNodePropPredDataset
 from tvm.script import tir as T
 from tvm.sparse import FormatRewriteRule, lower_sparse_buffer, lower_sparse_iter
-import tvm.sparse
-from ogb.nodeproppred import DglNodePropPredDataset
-from utils import get_dataset, ell
+from utils import ell, get_dataset
 
 
 @T.prim_func
@@ -53,6 +54,8 @@ def csrmm(
     A = T.match_sparse_buffer(a, (I, J), "float32")
     B = T.match_sparse_buffer(b, (J_detach, K1, K2, K3), "float32")
     C = T.match_sparse_buffer(c, (I, K1, K2, K3), "float32")
+
+    # "S" spatial purpose, "R" reduction purpose
     with T.sp_iter([I, J, K1, K2, K3], "SRSSS", "csrmm") as [i, j, k1, k2, k3]:
         with T.init():
             C[i, k1, k2, k3] = T.float32(0)
@@ -79,10 +82,14 @@ def bench_hyb(
     feat_size=128,
     cwm=2,
 ):
-    indptr, indices, _ = g.adj_sparse("csc")
+    indptr, indices, _ = g.adj_tensors("csc")
     m = g.num_dst_nodes()
     n = g.num_src_nodes()
     nnz = g.num_edges()
+    print(f"m {m} n {n} nnz{nnz}")
+    print("indices", indices.shape)
+    print("indptr", indptr.shape)
+
     if feat_size < 64:
         cwm = 1
     mod = tvm.IRModule.from_expr(csrmm)
@@ -101,22 +108,38 @@ def bench_hyb(
     # schedule
     mod = tvm.sparse.lower_sparse_iter(mod)
     sch = tvm.tir.Schedule(mod)
+    print("---------------------------------------")
+    print(mod.script())
     outer_blk = sch.get_block("csrmm0")
     inner_blk = sch.get_block("csrmm1")
     (i,) = sch.get_loops(outer_blk)
     j, foo, foi, fi = sch.get_loops(inner_blk)
+    print("---------------------------------------")
+    print(sch.mod.script())
+
+    # Schedule
     sch.reorder(foo, fi, j, foi)
     sch.bind(fi, "threadIdx.x")
     sch.bind(foo, "blockIdx.y")
     sch.unroll(foi)
+    print("---------------------------------------")
+    print("after unroll")
+    print(sch.mod.script())
+
+    # decompose into init + update
     io, ii = sch.split(i, [None, 8])
     sch.bind(io, "blockIdx.x")
     sch.bind(ii, "threadIdx.y")
     init_blk = sch.decompose_reduction(inner_blk, fi)
     ax0, ax1 = sch.get_loops(init_blk)[-2:]
     sch.bind(ax0, "threadIdx.x")
+
+    print("---------------------------------------")
+    print("final")
+    print(sch.mod.script())
     mod = tvm.sparse.lower_sparse_buffer(sch.mod)
     f = tvm.build(mod["main"], target="cuda")
+
     # prepare nd array
     indptr_nd = tvm.nd.array(indptr.numpy().astype("int32"), device=tvm.cuda(0))
     b_nd = tvm.nd.array(
@@ -125,8 +148,12 @@ def bench_hyb(
     )
     indices_nd = tvm.nd.array(indices.numpy().astype("int32"), device=tvm.cuda(0))
     c_nd = tvm.nd.array(np.zeros((n * feat_size,)).astype("float32"), device=tvm.cuda(0))
+
+    # Adj matrix
     a_nd = tvm.nd.array(np.ones((nnz,)).astype("float32"), device=tvm.cuda(0))
     args = [a_nd, b_nd, c_nd, indptr_nd, indices_nd]
+
+    # Kick off function
     f(*args)
     tvm.testing.assert_allclose(c_nd.numpy().reshape(-1, feat_size), y_golden.numpy(), rtol=1e-4)
     evaluator = f.time_evaluator(f.entry_name, tvm.cuda(0), number=100)
@@ -144,6 +171,7 @@ if __name__ == "__main__":
         print("feat_size =", feat_size)
         x = th.rand((g.num_src_nodes(), feat_size))
         y_golden = dgl.ops.copy_u_sum(g, x)
+        print(x.shape, y_golden.shape)
         bench_hyb(
             g,
             x,
@@ -151,3 +179,4 @@ if __name__ == "__main__":
             feat_size=feat_size,
             cwm=2,
         )
+        exit()
