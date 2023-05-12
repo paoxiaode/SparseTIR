@@ -21,12 +21,20 @@ Related work:
 - FlashAttention: https://arxiv.org/pdf/2205.14135.pdf
 """
 
+import argparse
+
+import dgl
+import numpy as np
+import scipy.sparse as sp
+import torch as th
 import tvm
+import tvm.sparse
 import tvm.testing
 import tvm.tir as tir
-import argparse
+from ogb.nodeproppred import DglNodePropPredDataset
 from tvm.script import tir as T
-from tvm.sparse import lower_sparse_buffer, lower_sparse_iter
+from tvm.sparse import FormatRewriteRule, lower_sparse_buffer, lower_sparse_iter
+from utils import ell, get_dataset
 
 
 """
@@ -100,17 +108,52 @@ def fusedmm(
         O[i, f] = O[i, f] + softmax[i, j] * V[j, f]
 
 
-def bench_fusedmm():
-    mod = tvm.IRModule.from_expr(fusedmm)
+def bench_fusedmm(g, x, y, feat_size):
+    indptr, indices, _ = g.adj_tensors("csc")
+    m = g.num_dst_nodes()
+    n = g.num_src_nodes()
+    nnz = g.num_edges()
+    print(f"m {m} n {n} nnz{nnz}")
+    print("indices", indices.shape)
+    print("indptr", indptr.shape)
+
+    mod = tvm.IRModule.from_expr(fusedmm.with_attr("horizontal_fuse", True))
+
+    params = mod["main"].params
+    param_map = {
+        params[6]: m,  # m
+        params[7]: n,  # n
+        params[8]: nnz,  # num_tiles,
+        params[9]: feat_size,
+    }
+
+    mod["main"] = mod["main"].specialize(param_map)
+
     mod = lower_sparse_iter(mod)
     sch = tir.Schedule(mod)
-    spmm_blk_outer = sch.get_block("spmm0")
-    print(mod["main"].script())
+    print("---------------------------------------")
+    print(mod.script())
+
+    # sddmm_blk_outer = sch.get_block("sddmm0")
+    # (i,) = sch.get_loops(spmm_blk_outer)
+    # io, ii = sch.split(i, [None, 32])
+    # sch.bind(ii, "threadIdx.x")
+    # sch.bind(io, "blockIdx.x")
+    # print(mod["main"].script())
+    # mod = tvm.sparse.lower_sparse_buffer(sch.mod)
+    # f = tvm.build(mod["main"], target="cuda")
+    # dev_module = f.import_module[0]
+    # print(dev_module.get_source())
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("FusedMM in Sparse-TIR")
-    parser.add_argument("--dataset", "-d", type=str, default="arxiv", help="dataset name")
+    parser.add_argument("--dataset", "-d", type=str, default="cora", help="dataset name")
     args = parser.parse_args()
     name = args.dataset
-    bench_fusedmm()
+    g = get_dataset(name)
+    feat_size = 256
+    x = th.rand((g.num_src_nodes(), feat_size))
+    y = (x @ x.t()) @ x
+    print("x", x.shape, "y", y.shape)
+    bench_fusedmm(g, x, y, feat_size)
